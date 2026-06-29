@@ -53,26 +53,46 @@ def kaikki_url(word):
             f"{w[0].lower()}/{w[:2].lower()}/{w}.jsonl")
 
 
-def load_records(args):
-    """Return the list of word records, from a local file or by download."""
-    if args.file:
-        with open(args.file, encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-    if not args.word:
-        sys.exit("Give a word, or --file a downloaded .jsonl. See --help.")
-    url = kaikki_url(args.word)
+def _records_label(records, fallback):
+    """A human label for a concept: the English word the data is about."""
+    for rec in records:
+        if rec.get("word"):
+            return rec["word"]
+    return fallback
+
+
+def download_records(word):
+    url = kaikki_url(word)
     req = urllib.request.Request(url, headers={"User-Agent": "conlang-helper"})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            sys.exit(f"No data found for '{args.word}' at {url}")
+            sys.exit(f"No data found for '{word}' at {url}")
         sys.exit(f"Download failed ({e.code}): {url}")
     except Exception as e:
         sys.exit(f"Could not reach kaikki.org: {e}\n"
                  "Tip: download the .jsonl by hand and use --file instead.")
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def load_sources(args):
+    """Return a list of (concept_label, records) pairs.
+
+    Accepts any number of --file inputs and/or a single downloaded word.
+    """
+    sources = []
+    for path in args.file or []:
+        with open(path, encoding="utf-8") as f:
+            recs = [json.loads(line) for line in f if line.strip()]
+        sources.append((_records_label(recs, path), recs))
+    if args.word:
+        recs = download_records(args.word)
+        sources.append((_records_label(recs, args.word), recs))
+    if not sources:
+        sys.exit("Give a word, or one or more --file inputs. See --help.")
+    return sources
 
 
 def collect_translations(records, sense_filter=None):
@@ -292,18 +312,167 @@ def print_inventory(rows, inventory):
 
 
 # --------------------------------------------------------------------------
+# Cross-concept comparison
+# --------------------------------------------------------------------------
+
+def _form_counters(rows):
+    sounds, skeletons, syls = Counter(), Counter(), Counter()
+    for r in rows:
+        f = normalize(sound_form(r))
+        if not f:
+            continue
+        sounds.update(f)
+        skeletons[cv_skeleton(f)] += 1
+        for s in syllable_split(f):
+            syls[s] += 1
+    return sounds, skeletons, syls
+
+
+def print_compare(concept_rows, top):
+    """concept_rows: list of (label, rows). Show each concept's signature
+    and what sounds/shapes they share vs. that set one apart."""
+    print(f"\n=== Comparing {len(concept_rows)} concepts ===")
+    per_sounds = {}
+    for label, rows in concept_rows:
+        sounds, skeletons, syls = _form_counters(rows)
+        per_sounds[label] = sounds
+        tot = sum(sounds.values()) or 1
+        top_sounds = ", ".join(f"{k}({100 * v // tot}%)"
+                               for k, v in sounds.most_common(top))
+        top_shapes = ", ".join(f"{k}" for k, _ in skeletons.most_common(5))
+        top_syls = ", ".join(f"{k}" for k, _ in syls.most_common(8))
+        print(f"\n# {label}  ({len(rows)} translations)")
+        print(f"   top sounds : {top_sounds}")
+        print(f"   top shapes : {top_shapes}")
+        print(f"   top syllabs: {top_syls}")
+
+    if len(per_sounds) > 1:
+        # Sounds shared prominently across every concept (the 'universal feel'),
+        # using each concept's normalized share so big lists don't dominate.
+        labels = list(per_sounds)
+        shares = {}
+        for lab, c in per_sounds.items():
+            tot = sum(c.values()) or 1
+            shares[lab] = {k: v / tot for k, v in c.items()}
+        common = set(shares[labels[0]])
+        for lab in labels[1:]:
+            common &= set(shares[lab])
+        ranked = sorted(common,
+                        key=lambda k: min(shares[lab][k] for lab in labels),
+                        reverse=True)
+        print("\n# Shared across ALL concepts (min share):")
+        for k in ranked[:top]:
+            mn = min(shares[lab][k] for lab in labels)
+            print(f"   {k:<4} {100 * mn:4.1f}%")
+
+
+# --------------------------------------------------------------------------
+# Phonotactic word generator
+# --------------------------------------------------------------------------
+
+def build_markov(forms, order=2):
+    """Order-N character model with start/end padding ('^' start, '$' end)."""
+    model = {}
+    start = "^" * order
+    for f in forms:
+        seq = start + f + "$"
+        for i in range(len(seq) - order):
+            ctx = seq[i:i + order]
+            nxt = seq[i + order]
+            model.setdefault(ctx, Counter())[nxt] += 1
+    return model, order
+
+
+def generate_word(model, order, rng, max_len=12):
+    import bisect
+    ctx = "^" * order
+    out = []
+    for _ in range(max_len):
+        counter = model.get(ctx)
+        if not counter:
+            break
+        items = list(counter.items())
+        weights, cum, run = [c for _, c in items], [], 0
+        for w in weights:
+            run += w
+            cum.append(run)
+        pick = items[bisect.bisect(cum, rng.random() * run)][0]
+        if pick == "$":
+            break
+        out.append(pick)
+        ctx = (ctx + pick)[-order:]
+    return "".join(out)
+
+
+def print_generate(rows, n, args, rng):
+    forms = [normalize(sound_form(r)) for r in rows]
+    forms = [f for f in forms if f]
+    if args.inventory:  # train only on words that fit the target phonology
+        allowed = set(args.inventory.replace(",", " ").split())
+        singles = {t for t in allowed if len(t) == 1}
+        multi = sorted((t for t in allowed if len(t) > 1), key=len, reverse=True)
+
+        def fits(s):
+            i = 0
+            while i < len(s):
+                for m in multi:
+                    if s.startswith(m, i):
+                        i += len(m)
+                        break
+                else:
+                    if s[i] in singles:
+                        i += 1
+                    else:
+                        return False
+            return True
+        forms = [f for f in forms if fits(f)]
+        if not forms:
+            sys.exit("No source words fit that inventory; loosen --inventory.")
+
+    lo, hi = args.length
+    model, order = build_markov(forms)
+    real = set(forms)
+    seen, results, tries = set(), [], 0
+    while len(results) < n and tries < n * 400:
+        tries += 1
+        w = generate_word(model, order, rng)
+        if (lo <= len(w) <= hi and w not in real and w not in seen
+                and any(c in VOWELS for c in w)):
+            seen.add(w)
+            results.append(w)
+
+    print(f"\n=== {len(results)} invented words "
+          f"(learned from {len(forms)} real translations) ===\n")
+    for w in results:
+        print(f"   {w}")
+    if len(results) < n:
+        print(f"\n(only {len(results)} unique words fit the constraints; "
+              "try a wider --length or more source data)")
+
+
+# --------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
         description="Gather and analyze a concept's translations for conlanging")
     ap.add_argument("word", nargs="?", help="English concept, e.g. thunder "
                     "(downloads data; omit if using --file)")
-    ap.add_argument("--file", help="local .jsonl downloaded from kaikki.org")
+    ap.add_argument("--file", action="append", metavar="PATH",
+                    help="local .jsonl from kaikki.org; repeatable "
+                    "(several files enable --compare and pooled --generate)")
     ap.add_argument("--sense", help="only keep translations whose meaning "
                     "contains this text, e.g. 'lightning'")
     ap.add_argument("--csv", metavar="FILE", help="save results to a CSV file")
     ap.add_argument("--stats", action="store_true",
                     help="report sound / syllable patterns")
+    ap.add_argument("--compare", action="store_true",
+                    help="compare sound signatures across the loaded concepts")
+    ap.add_argument("--generate", type=int, metavar="N",
+                    help="invent N new words from the learned phonotactics")
+    ap.add_argument("--length", metavar="MIN-MAX", default="3-9",
+                    help="length range for --generate (default 3-9)")
+    ap.add_argument("--seed", type=int, help="random seed for reproducible "
+                    "--generate output")
     ap.add_argument("--inventory", metavar="SOUNDS",
                     help="keep only words built from these sounds, e.g. "
                     '"p t k m n s r a i u" (space or comma separated)')
@@ -311,21 +480,34 @@ def main():
                     help="how many entries per stats list (default 15)")
     args = ap.parse_args()
 
-    records = load_records(args)
-    rows = collect_translations(records, args.sense)
-    if not rows:
+    sources = load_sources(args)
+    concept_rows = [(label, collect_translations(recs, args.sense))
+                    for label, recs in sources]
+    concept_rows = [(lab, rows) for lab, rows in concept_rows if rows]
+    if not concept_rows:
         sys.exit("No translations found (check the word, file, or --sense).")
+    all_rows = [r for _, rows in concept_rows for r in rows]
+    title = " + ".join(lab for lab, _ in concept_rows)
 
-    title = args.word or (args.file or "translations")
-    if args.stats:
-        print_stats(rows, args.top)
+    if args.compare:
+        print_compare(concept_rows, args.top)
+    elif args.generate:
+        import random
+        try:
+            lo, hi = (int(x) for x in args.length.split("-"))
+        except ValueError:
+            sys.exit("--length must look like MIN-MAX, e.g. 3-9")
+        args.length = (lo, hi)
+        print_generate(all_rows, args.generate, args, random.Random(args.seed))
+    elif args.stats:
+        print_stats(all_rows, args.top)
     elif args.inventory:
-        print_inventory(rows, args.inventory)
+        print_inventory(all_rows, args.inventory)
     else:
-        print_list(rows, title)
+        print_list(all_rows, title)
 
     if args.csv:
-        write_csv(rows, args.csv)
+        write_csv(all_rows, args.csv)
 
 
 if __name__ == "__main__":

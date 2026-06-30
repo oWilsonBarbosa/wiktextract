@@ -33,13 +33,23 @@
 # accent/diacritic marks stripped -- an approximation, good enough for
 # spotting cross-linguistic tendencies, but not a true phonemic transcription.
 #
-# For REAL phonemes, pass --ipa: it reads the IPA in each entry's `sounds`
-# field and segments it into proper phonemes (affricates like t͡ʃ, length ː,
-# etc. are kept whole). Translation lists almost never carry IPA, so --ipa is
-# meant for word ENTRY files: download each language's own entry (e.g. the
-# Finnish page for "ukkonen") and feed them with --file.
+# For REAL phonemes, pass --ipa: it segments IPA into proper phonemes
+# (affricates like t͡ʃ, length ː, etc. are kept whole). Translation lists
+# carry no IPA themselves, so there are two ways to supply it:
+#
+#   * --ipa-from DUMP.jsonl(.gz): point at ONE bulk wiktextract dump (the
+#     English extraction already contains the foreign-word entries, each with
+#     their own IPA). The tool scans it once and attaches IPA to every
+#     translation -- no scraping word by word. This is the easy bulk path.
+#       python3 conlang-translations.py --file thunder.jsonl \
+#               --ipa-from raw-wiktextract-data.jsonl.gz --stats
+#
+#   * --file each word's own entry (good for just a handful of words).
+#
+# Get a bulk dump from https://kaikki.org/dictionary/rawdata.html
 
 import sys
+import gzip
 import csv as csv_module
 import json
 import argparse
@@ -116,6 +126,7 @@ def collect_translations(records, sense_filter=None):
             rows.append({
                 "sense": sense,
                 "lang": tr.get("lang", tr.get("code", "?")),
+                "code": tr.get("code", ""),
                 "word": word,
                 "roman": tr.get("roman", ""),
                 "ipa": tr.get("ipa", ""),
@@ -133,26 +144,97 @@ def rows_to_items(rows):
              "form": sound_form(r), "tags": r["tags"]} for r in rows]
 
 
-def collect_ipa(records, rows):
-    """Items from REAL IPA in each entry's `sounds` field.
+def collect_ipa(records, rows, index=None):
+    """Items from REAL IPA.
 
-    Translation lists almost never carry IPA, so genuine phonemic analysis
-    needs each word's own entry (e.g. download the Finnish entry for
-    'ukkonen'). Any IPA that does appear on a translation is included too.
+    With an `index` (built from a bulk dump by --ipa-from), every translation
+    is looked up to attach its own-language IPA -- no per-word scraping. The
+    headword entries' own `sounds` are always included too, plus any IPA that
+    happens to sit directly on a translation.
     """
     items = []
-    for rec in records:
-        lang, word = rec.get("lang", "?"), rec.get("word", "?")
-        for s in rec.get("sounds", []):
-            ipa = s.get("ipa")
-            if ipa:
-                items.append({"lang": lang, "label": word, "form": ipa,
-                              "tags": ", ".join(s.get("tags", []))})
+    # In lookup mode the focus is the translations, so skip the (single,
+    # source-language) headword entries to avoid over-weighting them.
+    if index is None:
+        for rec in records:
+            lang, word = rec.get("lang", "?"), rec.get("word", "?")
+            for s in rec.get("sounds", []):
+                ipa = s.get("ipa")
+                if ipa:
+                    items.append({"lang": lang, "label": word, "form": ipa,
+                                  "tags": ", ".join(s.get("tags", []))})
     for r in rows:
-        if r.get("ipa"):
+        ipa = r.get("ipa") or (lookup_ipa(index, r) if index else "")
+        if ipa:
             items.append({"lang": r["lang"], "label": r["word"],
-                          "form": r["ipa"], "tags": r["tags"]})
+                          "form": ipa, "tags": r["tags"]})
     return items
+
+
+def _open_maybe_gz(path):
+    """Open a .jsonl or .jsonl.gz file as text, without decompressing to disk."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
+
+def _first_ipa(rec):
+    for s in rec.get("sounds", []):
+        if s.get("ipa"):
+            return s["ipa"]
+    return ""
+
+
+def _row_keys(row):
+    """Index keys a translation can be matched on: (lang/code, word)."""
+    lang = (row["lang"] or "").lower()
+    code = row.get("code", "") or ""
+    word = row["word"]
+    return {(lang, word), (code, word),
+            (lang, word.lower()), (code, word.lower())}
+
+
+def build_ipa_index(paths, rows):
+    """Stream big wiktextract dump(s) once and pull IPA only for words we need.
+
+    Keeping just the needed (language, word) pairs means even a multi-GB
+    dump uses little memory. Returns {(lang_or_code, word): ipa}.
+    """
+    needed = set()
+    for r in rows:
+        needed |= _row_keys(r)
+    index = {}
+    for path in paths:
+        with _open_maybe_gz(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                word = rec.get("word")
+                if not word:
+                    continue
+                lang = (rec.get("lang") or "").lower()
+                code = rec.get("lang_code") or rec.get("code") or ""
+                keys = [(lang, word), (code, word)]
+                if not any(k in needed for k in keys):
+                    continue
+                ipa = _first_ipa(rec)
+                if ipa:
+                    for k in keys:
+                        index.setdefault(k, ipa)
+    return index
+
+
+def lookup_ipa(index, row):
+    if not index:
+        return ""
+    for k in _row_keys(row):
+        if k in index:
+            return index[k]
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -560,31 +642,53 @@ def main():
                     help="keep only words built from these sounds, e.g. "
                     '"p t k m n s r a i u" (space or comma separated)')
     ap.add_argument("--ipa", action="store_true",
-                    help="analyze REAL IPA from each entry's `sounds` field "
-                    "(phonemes, not spelling). Best with downloaded word "
-                    "entries; translation lists rarely carry IPA.")
+                    help="analyze REAL IPA (phonemes, not spelling). Reads "
+                    "each entry's `sounds`; combine with --ipa-from to attach "
+                    "IPA to every translation.")
+    ap.add_argument("--ipa-from", action="append", metavar="DUMP",
+                    dest="ipa_from",
+                    help="a bulk wiktextract .jsonl(.gz) dump to look up IPA "
+                    "for translations (so you need ONE big download, not one "
+                    "per word). Repeatable. Implies --ipa.")
     ap.add_argument("--top", type=int, default=15,
                     help="how many entries per stats list (default 15)")
     args = ap.parse_args()
+    if args.ipa_from:
+        args.ipa = True
 
     sources = load_sources(args)
-    # Build, per concept: the translation rows and the analysis items.
+    # First gather translation rows per concept (needed to build the index).
     concepts = []  # list of (label, items, rows)
-    for label, recs in sources:
-        rows = collect_translations(recs, args.sense)
-        items = collect_ipa(recs, rows) if args.ipa else rows_to_items(rows)
+    staged = [(label, collect_translations(recs, args.sense), recs)
+              for label, recs in sources]
+    all_rows = [r for _, rows, _ in staged for r in rows]
+
+    index = None
+    if args.ipa_from:
+        print(f"[IPA] scanning {len(args.ipa_from)} dump file(s) for "
+              f"{len(all_rows)} translations (one pass, please wait)...",
+              file=sys.stderr)
+        index = build_ipa_index(args.ipa_from, all_rows)
+        matched = sum(1 for r in all_rows if lookup_ipa(index, r))
+        langs = len({r["lang"] for r in all_rows if lookup_ipa(index, r)})
+        print(f"[IPA] matched {matched} of {len(all_rows)} translations "
+              f"across {langs} languages.", file=sys.stderr)
+
+    for label, rows, recs in staged:
+        items = (collect_ipa(recs, rows, index) if args.ipa
+                 else rows_to_items(rows))
         if items or rows:
             concepts.append((label, items, rows))
     if not concepts:
         sys.exit("No data found (check the word, file, or --sense).")
     all_items = [it for _, items, _ in concepts for it in items]
-    all_rows = [r for _, _, rows in concepts for r in rows]
     title = " + ".join(lab for lab, _, _ in concepts)
 
     if args.ipa and not all_items:
-        sys.exit("No IPA found. The data has translations but no `sounds`/IPA. "
-                 "Download each word's own entry (which carries IPA) and pass "
-                 "them with --file, then re-run with --ipa.")
+        sys.exit("No IPA found. Translation lists carry no IPA on their own.\n"
+                 "Either: (a) pass a bulk dump with --ipa-from FILE.jsonl(.gz) "
+                 "to look IPA up, or (b) --file each word's own entry, then "
+                 "re-run with --ipa.")
 
     if args.compare:
         print_compare([(lab, items) for lab, items, _ in concepts],
